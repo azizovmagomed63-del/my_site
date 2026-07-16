@@ -140,7 +140,7 @@ def handle_search(message):
     if result.get("too_long"):
         mins = result["duration"] // 60
         bot.edit_message_text(
-            f"Нашёл «{result['title']}», но это {mins} мин. — слишком длинное, пропускаю.",
+            f"Нашёл «{result['title']}», но это {mins} мин. — слишком длинное, пропускаю. Введите точное название.",
             message.chat.id, status.message_id,
         )
         return
