@@ -1,150 +1,168 @@
 """
-Поиск музыки в Telegram с помощью Telethon.
+Telegram-бот для поиска музыки по названию трека.
 
-Скрипт умеет:
-  1. Искать аудиофайлы (музыку) по текстовому запросу в конкретном чате/канале
-     или во всех диалогах сразу.
-  2. Скачивать найденные треки в папку downloads/.
+Логика:
+  Пользователь пишет боту название песни/исполнителя ->
+  бот ищет её на YouTube (через yt-dlp) ->
+  скачивает лучшую аудиодорожку, конвертирует в mp3 ->
+  отправляет пользователю как аудиофайл.
 
 Установка зависимостей:
-    pip install telethon
+    pip install pyTelegramBotAPI yt-dlp
 
-Перед запуском получите api_id и api_hash на https://my.telegram.org
-(раздел "API development tools").
+Также нужен ffmpeg (для конвертации в mp3):
+  - Windows: скачать с https://www.gyan.dev/ffmpeg/builds/ и добавить bin/ в PATH
+  - Проверить: в терминале выполнить `ffmpeg -version`
+
+Токен бота (получен у @BotFather в Telegram) НЕ вписывайте прямо в код,
+если планируете кому-то показывать этот файл. Задайте его как переменную
+окружения:
+
+  Windows (PowerShell):
+      $env:BOT_TOKEN = "ваш_токен"
+  Windows (cmd):
+      set BOT_TOKEN=ваш_токен
+  Linux/macOS:
+      export BOT_TOKEN=ваш_токен
 
 Запуск:
-    python telegram_music_search.py "название песни"
-    python telegram_music_search.py "название песни" --chat @some_music_channel
-    python telegram_music_search.py "название песни" --all-dialogs --download
+    python search_music_bot.py
 """
 
-import argparse
-import asyncio
 import os
+import glob
+import shutil
+import logging
+from typing import Optional
 
-from telethon import TelegramClient
-from telethon.tl.types import (
-    InputMessagesFilterMusic,
-    DocumentAttributeAudio,
-)
+import telebot
+import yt_dlp
 
-# ==== Заполните своими данными или задайте через переменные окружения ====
-API_ID = int(os.environ.get("TG_API_ID", "0"))
-API_HASH = os.environ.get("TG_API_HASH", "")
-SESSION_NAME = "music_search_session"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("music_bot")
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOWNLOAD_DIR = "downloads"
-# ===========================================================================
+MAX_DURATION_SEC = 15 * 60  # не скачиваем треки длиннее 15 минут (защита от случайных фильмов/подкастов)
 
-
-def format_track(message) -> str:
-    """Формирует человекочитаемое описание найденного трека."""
-    audio = message.audio
-    performer, title = None, None
-
-    if audio:
-        for attr in audio.attributes:
-            if isinstance(attr, DocumentAttributeAudio):
-                performer = attr.performer
-                title = attr.title
-
-    name = " - ".join(filter(None, [performer, title])) or (message.file.name if message.file else "audio")
-    duration = f"{audio.attributes[0].duration}s" if audio and audio.attributes else "?"
-    chat_title = getattr(message.chat, "title", None) or getattr(message.chat, "first_name", "Saved Messages")
-
-    return f"[{message.id}] {name} ({duration}) — {chat_title} — {message.date:%Y-%m-%d}"
-
-
-async def search_in_chat(client: TelegramClient, chat, query: str, limit: int):
-    """Ищет музыку по запросу в одном чате/канале."""
-    results = []
-    async for message in client.iter_messages(
-        chat,
-        search=query,
-        filter=InputMessagesFilterMusic,
-        limit=limit,
-    ):
-        if message.audio:
-            results.append(message)
-    return results
-
-
-async def search_all_dialogs(client: TelegramClient, query: str, limit_per_chat: int):
-    """Ищет музыку по запросу во всех диалогах пользователя."""
-    all_results = []
-    async for dialog in client.iter_dialogs():
-        try:
-            found = await search_in_chat(client, dialog.entity, query, limit_per_chat)
-        except Exception as e:
-            print(f"  Пропускаю '{dialog.name}': {e}")
-            continue
-        if found:
-            print(f"  Найдено {len(found)} треков в '{dialog.name}'")
-            all_results.extend(found)
-    return all_results
-
-
-async def download_tracks(client: TelegramClient, messages):
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    for message in messages:
-        print(f"Скачиваю: {format_track(message)}")
-        path = await message.download_media(file=DOWNLOAD_DIR)
-        print(f"  -> {path}")
-
-
-async def main():
-    parser = argparse.ArgumentParser(description="Поиск музыки в Telegram через Telethon")
-    parser.add_argument("query", help="Текст запроса (название трека/исполнитель)")
-    parser.add_argument(
-        "--chat",
-        help="Username, ID или ссылка на чат/канал для поиска (по умолчанию — Избранное/Saved Messages)",
-        default="me",
+if not BOT_TOKEN:
+    raise SystemExit(
+        "Не задан BOT_TOKEN. Установите переменную окружения BOT_TOKEN "
+        "или впишите токен прямо в переменную BOT_TOKEN в коде (не рекомендуется, если делитесь файлом)."
     )
-    parser.add_argument(
-        "--all-dialogs",
-        action="store_true",
-        help="Искать во всех диалогах, а не в одном чате",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=50,
-        help="Максимум результатов на один чат (по умолчанию 50)",
-    )
-    parser.add_argument(
-        "--download",
-        action="store_true",
-        help="Скачать найденные треки в папку downloads/",
-    )
-    args = parser.parse_args()
 
-    if not API_ID or not API_HASH:
-        raise SystemExit(
-            "Не заданы TG_API_ID / TG_API_HASH. "
-            "Получите их на https://my.telegram.org и задайте как переменные окружения "
-            "или впишите прямо в скрипт (API_ID, API_HASH)."
+bot = telebot.TeleBot(BOT_TOKEN)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def search_and_download(query: str, dest_dir: str) -> Optional[dict]:
+    """
+    Ищет трек на YouTube по запросу и скачивает лучшую аудиодорожку в mp3.
+    Возвращает словарь с метаданными (title, artist, filepath) или None, если ничего не нашлось.
+    """
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch1",
+        "outtmpl": os.path.join(dest_dir, "%(id)s.%(ext)s"),
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+
+        # extract_info с default_search вернёт плейлист из 1 результата
+        if "entries" in info:
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                return None
+            info = entries[0]
+
+        duration = info.get("duration") or 0
+        if duration and duration > MAX_DURATION_SEC:
+            return {"too_long": True, "title": info.get("title"), "duration": duration}
+
+        ydl.download([info["webpage_url"]])
+        video_id = info["id"]
+
+    # находим итоговый mp3-файл (после постпроцессинга расширение меняется на .mp3)
+    matches = glob.glob(os.path.join(dest_dir, f"{video_id}.mp3"))
+    if not matches:
+        return None
+
+    return {
+        "filepath": matches[0],
+        "title": info.get("title") or query,
+        "artist": info.get("uploader") or "",
+        "duration": info.get("duration") or 0,
+        "too_long": False,
+    }
+
+
+@bot.message_handler(commands=["start", "help"])
+def handle_start(message):
+    bot.reply_to(
+        message,
+        "Привет! Отправь мне название трека или исполнителя — найду и пришлю аудио.\n"
+        "Пример: Виктор Цой - Кукушка",
+    )
+
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def handle_search(message):
+    query = message.text.strip()
+    if not query:
+        return
+
+    status = bot.reply_to(message, f"Ищу «{query}»...")
+
+    try:
+        result = search_and_download(query, DOWNLOAD_DIR)
+    except Exception as e:
+        log.exception("Ошибка при поиске/скачивании")
+        bot.edit_message_text("Произошла ошибка при поиске. Попробуй другой запрос.",
+                               message.chat.id, status.message_id)
+        return
+
+    if result is None:
+        bot.edit_message_text("Ничего не нашлось. Попробуй сформулировать запрос иначе.",
+                               message.chat.id, status.message_id)
+        return
+
+    if result.get("too_long"):
+        mins = result["duration"] // 60
+        bot.edit_message_text(
+            f"Нашёл «{result['title']}», но это {mins} мин. — слишком длинное, пропускаю.",
+            message.chat.id, status.message_id,
         )
+        return
 
-    async with TelegramClient(SESSION_NAME, API_ID, API_HASH) as client:
-        print(f"Ищу '{args.query}'...")
+    bot.edit_message_text(f"Нашёл: {result['title']}. Отправляю...", message.chat.id, status.message_id)
 
-        if args.all_dialogs:
-            results = await search_all_dialogs(client, args.query, args.limit)
-        else:
-            chat = await client.get_entity(args.chat)
-            results = await search_in_chat(client, chat, args.query, args.limit)
-
-        if not results:
-            print("Ничего не найдено.")
-            return
-
-        print(f"\nВсего найдено треков: {len(results)}\n")
-        for message in results:
-            print(format_track(message))
-
-        if args.download:
-            print("\nНачинаю скачивание...")
-            await download_tracks(client, results)
+    try:
+        with open(result["filepath"], "rb") as audio_file:
+            bot.send_audio(
+                message.chat.id,
+                audio_file,
+                title=result["title"],
+                performer=result["artist"],
+            )
+    finally:
+        # чистим за собой, чтобы диск не забивался
+        try:
+            os.remove(result["filepath"])
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    log.info("Бот запущен, жду сообщений...")
+    bot.infinity_polling()
